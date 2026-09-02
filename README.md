@@ -1,3 +1,5 @@
+**WORK IN PROGRESS / ALPHA / FIRST COMMIT**
+
 # pi-zg
 
 Minimal [Pi](https://github.com/earendil-works/pi-mono) extension that gives Pi a
