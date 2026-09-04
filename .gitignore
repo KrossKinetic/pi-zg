@@ -1,0 +1,4 @@
+node_modules/
+.zvec-grep/
+*.log
+.DS_Store
