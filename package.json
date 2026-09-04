@@ -1,5 +1,5 @@
 {
-	"name": "pi-zg",
+	"name": "@krosskinetic/pi-zg",
 	"version": "0.1.0",
 	"description": "Pi extension for zvec-grep (zg): semantic code search, managed ripgrep, and shared-server-aware index management",
 	"type": "module",
