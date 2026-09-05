@@ -1,5 +1,3 @@
-**WORK IN PROGRESS / ALPHA**
-
 # @krosskinetic/pi-zg
 
 A [Pi](https://github.com/earendil-works/pi-mono) package that natively integrates
