@@ -1,22 +1,23 @@
 **WORK IN PROGRESS / ALPHA**
 
-# pi-zg
+# @krosskinetic/pi-zg
 
 A [Pi](https://github.com/earendil-works/pi-mono) package that natively integrates
-[zvec-grep](https://github.com/) (`zg`) semantic code search into Pi: it manages
-`zg`'s shared server, offers to build a missing index interactively, and gives
-the agent three tools (`zg_search`, `zg_rg`, `zg_index`) plus three commands
-(`/zg-status`, `/zg-index`, `/zg-server`). It calls an existing local `zg` CLI;
-it does not install or bundle zvec-grep itself.
+[zvec-grep](https://github.com/) (`zg`) semantic code search into Pi: it offers
+to build a missing index interactively, and gives the agent four tools
+(`zg_search`, `zg_rg`, `zg_index`, `zg_status`) plus three commands
+(`/zg-settings`, `/zg-status`, `/zg-index`). It calls an existing local `zg` CLI;
 
 ## Prerequisites
 
 Install `@zvec/zvec-grep` separately and ensure `zg` is on `PATH`.
+This extension invokes that local CLI; it does not install, bundle, or
+configure zvec-grep for you.
 
 ## Install into Pi
 
 ```bash
-pi install npm:pi-zg
+pi install npm:@krosskinetic/pi-zg
 ```
 
 For local development, from a checkout of this repo:
@@ -25,22 +26,33 @@ For local development, from a checkout of this repo:
 pi -e .
 ```
 
+## Quick start
+
+1. Install and configure `zg`, then verify that `zg version` works from your
+   project directory.
+2. Install this package and start Pi in the project you want to search.
+3. At session start, pi-zg checks whether `zg` is available and whether the
+   project has an index. Each `zg_search` refreshes the index first, so
+   results are never stale — no server daemon is used.
+4. Ask Pi a natural-language code-search question. Its `zg_search` tool
+   searches the index. If the project has not been indexed, pi-zg offers to
+   build one interactively.
+
+For example, ask: “Where is authentication token refresh implemented?” For an
+exact identifier, literal, or regex search, Pi can use `zg_rg` instead.
+
 ## What it does
 
-### Shared server (`zg server`)
+### Always-fresh direct searches
 
-`zg` runs a shared, loopback daemon that other tools (Claude, Cursor, etc.,
-configured via `zg install`) may also use. This extension:
+This extension runs every search in **direct mode and refreshes the index before
+answering** (`zg query --mode direct --refresh wait`). It does **not** use or manage
+zg's shared server daemon — there is no background process to keep alive, start,
+or shut down, so nothing can linger as an orphan between sessions.
 
-- **Auto-starts** it at session start if it isn't already running
-  (`--no-zg-autostart` disables this). `zg server on` is idempotent, so this
-  is safe to run every session.
-- **Never auto-stops it** — since it's shared, stopping it could break other
-  tools relying on it. Use `/zg-server off` to stop it explicitly.
-
-With the server running, `zg query` refreshes the index in the background
-automatically after file changes, so `zg_index` is rarely needed once a
-project has an initial index.
+Because each semantic search rebuilds any stale parts of the index first, results
+are never stale: after editing a file, the next `zg_search` reflects the change.
+This also means no index auto-refresh daemon needs to run at all.
 
 ### Tools (LLM-callable)
 
@@ -54,33 +66,77 @@ project has an initial index.
   does not require an index.
 - **`zg_index`** — build, rebuild, or drop the persistent index. Gated by
   prompt guidelines so the agent only uses it when the user explicitly asks.
+- **`zg_status`** — report zg version and the current project's index status.
+  Reads pi's cached zg state, so no extra `zg` subprocess is spawned for it.
 
+`zg_search` accepts a natural-language `query` and an optional `limit` of
+1–100 results (zg defaults to 7). `zg_rg` accepts a regex `pattern`, optional
+paths, `fixedString` for literal matching, and one `glob` filter. Its output
+and the output of the other tools are capped at 2,000 lines or 50 KB.
+
+
+#### Choosing a search tool
+
+Use the right tool for the kind of query, and don't reach for grep when semantic
+search is the better fit:
+
+- **`zg_search`** — find code by **meaning**. Use when you don't know the exact
+  identifiers or wording (“where is token refresh handled”, “how does the cache
+  layer work”). Keyword grep would miss these.
+- **`zg_rg`** — find code by **exact text**: a known identifier, string literal, or
+  regex, honoring the project's ignore/glob rules.
+- **Pi's built-in `grep`** — a quick literal scan when you don't need zg's
+  ignore rules or rg features.
+
+In short: concept → `zg_search`; exact token/regex → `zg_rg`; everything is
+refreshed before answering, so you always search current code.
 ### Commands (human-invoked)
 
-- **`/zg-status`** — zg version, server state, and index status/coverage.
+- **`/zg-settings`** — interactive configuration for zg's default embedding
+  model, embedding device, and provider API key.
+- **`/zg-status`** — zg version and index status/coverage.
 - **`/zg-index [--rebuild|--drop]`** — build, rebuild, or drop the index
   directly, without going through the LLM. Confirms before `--drop`.
-- **`/zg-server <on|off|status>`** — explicit manual control of the shared
-  daemon. Confirms before `off`, since other tools may depend on it.
+
+### Settings (`/zg-settings`)
+
+`/zg-settings` exposes the configuration that most directly affects Pi search:
+
+- **Default embedding model** — sets zg's persistent default for newly built
+  indexes, for example `local/potion-code-16m-v2` or
+  `qwen/text-embedding-v4`. Existing indexes keep their recorded embedding
+  schema.
+- **Embedding device** — configures `auto`, `cpu`, `metal`, `vulkan`, or
+  `cuda` for a specified local model.
+- **Provider API key** — saves credentials for a named embedding provider via
+  `zg config provider set`. The value is passed directly to zg and is not
+  shown in Pi notifications.
+
+For advanced index-selection rules, remote endpoints, authentication, and
+other less-common settings, use the underlying `zg` CLI directly.
 
 ### Status
 
-The footer shows `server ●/○` and `index ✓/✗` (colored via the active
-theme), refreshed at session start and at the start of every turn.
+The footer shows `index ✓/✗` (colored via the active theme), refreshed at
+session start and at the start of every turn.
 
 ### Flags
 
-- `--no-zg-autostart` — disable automatically starting the shared server.
 - `--no-zg-onboard` — disable the interactive "build an index?" offer;
   `zg_search` fails with a manual-fix message instead (useful for
   non-interactive/scripted `pi -p` runs).
+
+Pass these when launching Pi, for example:
+
+```bash
+pi --no-zg-onboard
+```
 
 ## Non-goals
 
 - Does not register zg's MCP server as an actual MCP tool source inside Pi
   — Pi extensions have no MCP-client API, so integration stays CLI-based
-  (`pi.exec`), just daemon-aware and stateful rather than re-deriving status
-  via subprocess spawns before every call.
+  (`pi.exec`), stateful rather than re-deriving status via subprocess spawns
+  before every call.
 - Does not override Pi's built-in `grep` tool. `zg_search`/`zg_rg` are
   purely additive.
-- Does not auto-stop the shared `zg` server.

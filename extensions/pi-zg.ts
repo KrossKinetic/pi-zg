@@ -9,10 +9,9 @@ import { Type } from "typebox";
  * pi-zg: a native Pi integration for the zvec-grep (`zg`) CLI.
  *
  * Beyond wrapping `zg query`/`zg index`, this extension:
- * - Auto-starts zg's shared server at session start so queries get
- *   background index auto-refresh for free (never auto-stops it, since
- *   it's a daemon other agents/tools may also depend on).
- * - Caches zg's availability/server/index state per session (refreshed at
+ * - Runs every search in direct mode, refreshing the index before answering so
+ *   results are never stale (no background server daemon involved).
+ * - Caches zg's availability and index state per session (refreshed at
  *   session_start and each turn_start) instead of re-deriving it with
  *   extra `zg` subprocess spawns before every tool call.
  * - Offers to build a missing index interactively instead of just failing.
@@ -25,15 +24,12 @@ import { Type } from "typebox";
 
 const STATUS_KEY = "pi-zg";
 const DEFAULT_LOCAL_MODEL = "local/potion-code-16m-v2";
-
 interface ZgState {
 	/** Whether refreshZgState has run at least once this session. */
 	checked: boolean;
 	/** Whether `zg` is on PATH. */
 	available: boolean;
 	version?: string;
-	/** Whether the shared zg server daemon is up and ready. */
-	serverRunning: boolean;
 	/** Whether the current project has a ready index. */
 	indexed: boolean;
 	/** Whether the user already declined the "build an index?" offer this session. */
@@ -44,7 +40,6 @@ function createZgState(): ZgState {
 	return {
 		checked: false,
 		available: false,
-		serverRunning: false,
 		indexed: false,
 		declinedIndexOffer: false,
 	};
@@ -65,12 +60,12 @@ function renderStatus(ctx: ExtensionContext, state: ZgState) {
 		ctx.ui.setStatus(STATUS_KEY, theme.fg("dim", "zg: not found"));
 		return;
 	}
-	const server = state.serverRunning ? theme.fg("success", "server\u25cf") : theme.fg("dim", "server\u25cb");
 	const index = state.indexed ? theme.fg("success", "index\u2713") : theme.fg("warning", "index\u2717");
-	ctx.ui.setStatus(STATUS_KEY, `${server} ${index}`);
+	ctx.ui.setStatus(STATUS_KEY, index);
 }
 
-/** Refresh cached zg availability/server/index state and update the footer. */
+
+/** Refresh cached zg availability and index state, then update the footer. */
 async function refreshZgState(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
@@ -83,17 +78,12 @@ async function refreshZgState(
 	state.version = state.available ? version.stdout.trim() : undefined;
 
 	if (!state.available) {
-		state.serverRunning = false;
 		state.indexed = false;
 		renderStatus(ctx, state);
 		return state;
 	}
 
-	const [server, status] = await Promise.all([
-		execZg(pi, ["server", "status", "--check-ready"], ctx, { signal, timeout: 5_000 }),
-		execZg(pi, ["status", "--check-ready"], ctx, { signal, timeout: 5_000 }),
-	]);
-	state.serverRunning = server.code === 0;
+	const status = await execZg(pi, ["status", "--check-ready"], ctx, { signal, timeout: 5_000 });
 	state.indexed = status.code === 0;
 
 	renderStatus(ctx, state);
@@ -112,6 +102,83 @@ function compactOutput(output: string): string {
 function parseHitCount(output: string): number | undefined {
 	const match = output.match(/^hits:\s*(\d+)/m);
 	return match ? Number(match[1]) : undefined;
+}
+
+
+
+async function configureDefaultModel(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	const model = await ctx.ui.input("Default embedding model", "e.g. local/potion-code-16m-v2 or qwen/text-embedding-v4");
+	if (!model?.trim()) return;
+	const result = await execZg(pi, ["config", "model", "set", model.trim(), "--default"], ctx);
+	if (result.code !== 0) {
+		ctx.ui.notify("Could not set the embedding model. Inspect zg configuration in a terminal for details.", "error");
+		return;
+	}
+	ctx.ui.notify(`Default embedding model set to ${model.trim()}. Existing indexes keep their current schema.`, "info");
+}
+
+async function configureEmbeddingDevice(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	const model = await ctx.ui.input("Model to configure", "e.g. local/potion-code-16m-v2");
+	if (!model?.trim()) return;
+	const device = await ctx.ui.select("Embedding device", ["auto", "cpu", "metal", "vulkan", "cuda", "Cancel"]);
+	if (!device || device === "Cancel") return;
+	const result = await execZg(pi, ["config", "model", "set", model.trim(), "--device", device], ctx);
+	if (result.code !== 0) {
+		ctx.ui.notify("Could not set the embedding device. Inspect zg configuration in a terminal for details.", "error");
+		return;
+	}
+	ctx.ui.notify(`Embedding device for ${model.trim()} set to ${device}.`, "info");
+}
+
+async function configureProviderKey(pi: ExtensionAPI, ctx: ExtensionContext): Promise<void> {
+	const provider = await ctx.ui.input("Embedding provider", "e.g. qwen");
+	if (!provider?.trim()) return;
+	const apiKey = await ctx.ui.input("API key", "Paste the provider API key");
+	if (!apiKey?.trim()) return;
+	const result = await execZg(pi, ["config", "provider", "set", provider.trim(), "--api-key", apiKey.trim()], ctx);
+	if (result.code !== 0) {
+		ctx.ui.notify("Could not save the provider API key. Inspect zg configuration in a terminal for details.", "error");
+		return;
+	}
+	ctx.ui.notify(`Credentials saved for ${provider.trim()}.`, "info");
+}
+
+async function openZgSettings(pi: ExtensionAPI, ctx: ExtensionContext, state: ZgState): Promise<void> {
+	if (!state.checked) await refreshZgState(pi, ctx, state);
+
+	while (true) {
+		const choice = await ctx.ui.select("zg settings", [
+			"Default embedding model",
+			"Embedding device",
+			"Provider API key",
+			"View active settings",
+			"Done",
+		]);
+		if (!choice || choice === "Done") return;
+
+		switch (choice) {
+			case "Default embedding model":
+				await configureDefaultModel(pi, ctx);
+				break;
+			case "Embedding device":
+				await configureEmbeddingDevice(pi, ctx);
+				break;
+			case "Provider API key":
+				await configureProviderKey(pi, ctx);
+				break;
+			case "View active settings": {
+				await refreshZgState(pi, ctx, state);
+				const detail = await execZg(pi, ["status"], ctx);
+				ctx.ui.notify(
+					[
+						(detail.stdout || detail.stderr).trim(),
+					].join("\n"),
+					state.indexed ? "info" : "warning",
+				);
+				break;
+			}
+		}
+	}
 }
 
 /**
@@ -140,7 +207,7 @@ async function offerToBuildIndex(
 	}
 
 	ctx.ui.setWorkingMessage("Building zg index...");
-	let result = await execZg(pi, ["index"], ctx, { signal, timeout: 300_000 });
+	let result = await execZg(pi, ["index", "--mode", "direct"], ctx, { signal, timeout: 300_000 });
 
 	if (result.code !== 0 && /embedding/i.test(result.stderr)) {
 		// No default embedding model configured yet -- offer to set one and retry.
@@ -157,7 +224,10 @@ async function offerToBuildIndex(
 		}
 		if (model) {
 			await execZg(pi, ["config", "model", "set", model, "--default"], ctx, { signal });
-			result = await execZg(pi, ["index", "--embedding", model], ctx, { signal, timeout: 300_000 });
+			result = await execZg(pi, ["index", "--mode", "direct", "--embedding", model], ctx, {
+				signal,
+				timeout: 300_000,
+			});
 		}
 	}
 
@@ -176,29 +246,16 @@ async function offerToBuildIndex(
 export default function (pi: ExtensionAPI) {
 	const state = createZgState();
 
-	pi.registerFlag("no-zg-autostart", {
-		description: "Disable automatically starting the shared zg server at session start",
-		type: "boolean",
-		default: false,
-	});
 	pi.registerFlag("no-zg-onboard", {
 		description: "Disable the interactive offer to build a missing zg index; fail with a manual-fix message instead",
 		type: "boolean",
 		default: false,
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		await refreshZgState(pi, ctx, state);
+pi.on("session_start", async (_event, ctx) => {
+	await refreshZgState(pi, ctx, state);
+});
 
-		if (!pi.getFlag("no-zg-autostart") && state.available && !state.serverRunning) {
-			// Fire-and-forget: don't block startup on daemon warmup. `zg server on`
-			// is idempotent, so this is safe even if something else started it
-			// in the meantime.
-			execZg(pi, ["server", "on"], ctx, { timeout: 20_000 })
-				.then(() => refreshZgState(pi, ctx, state))
-				.catch(() => {});
-		}
-	});
 
 	pi.on("turn_start", async (_event, ctx) => {
 		if (state.available) {
@@ -210,7 +267,7 @@ export default function (pi: ExtensionAPI) {
 		name: "zg_search",
 		label: "zg search",
 		description:
-			"Semantic code search over the current project's zvec-grep index. Requires zg on PATH; offers to build a missing index interactively when possible. With the zg server running, the index refreshes in the background automatically. Returns at most 2,000 lines or 50 KB of CLI output.",
+				"Semantic (meaning-based) code search over the current project's zvec-grep index. The go-to when you want to find code by CONCEPT rather than exact text — e.g. where authentication is handled, or how a feature works — without knowing the precise identifiers. Each call refreshes the index first, so results are never stale; it offers to build the index interactively if none exists. Prefer over keyword grep when an exact-token search would miss relevant code. For precise identifiers, string literals, or regex, use zg_rg or the built-in grep tool instead. Returns at most 2,000 lines or 50 KB of CLI output.",
 		promptSnippet: "Semantic search in the current project's zg index",
 		parameters: Type.Object({
 			query: Type.String({ minLength: 1, description: "Semantic code-search query" }),
@@ -237,7 +294,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			}
 
-			const args = ["query"];
+			const args = ["query", "--mode", "direct", "--refresh", "wait"];
 			if (params.limit !== undefined) args.push("--limit", String(params.limit));
 			args.push(params.query);
 
@@ -260,7 +317,7 @@ export default function (pi: ExtensionAPI) {
 		name: "zg_rg",
 		label: "zg managed ripgrep",
 		description:
-			"Exhaustive exact-match search via zvec-grep's managed ripgrep (`zg query --rg`). Respects this project's configured ignore/glob rules. Complements zg_search (semantic) and the built-in grep tool; does not require an index.",
+			"Exhaustive exact-match search via zvec-grep's managed ripgrep (`zg query --rg`). Use when you know the precise identifier, string literal, or regex to locate and want results that honor the project's configured ignore/glob rules (e.g. excluding node_modules). Prefer it over zg_search when you need literal/regex matches rather than meaning; prefer it over the built-in grep tool when you want rg's powers (globs, -F literal) with the project's ignore rules applied. Does not require an index.",
 		promptSnippet: "Exhaustive managed ripgrep search via zg (respects project ignore rules)",
 		parameters: Type.Object({
 			pattern: Type.String({ minLength: 1, description: "Pattern to search for" }),
@@ -302,7 +359,7 @@ export default function (pi: ExtensionAPI) {
 		name: "zg_index",
 		label: "zg index",
 		description:
-			"Build, rebuild, or drop the current project's persistent zvec-grep index. Use only when the user explicitly asks: with the zg server running, an existing index already refreshes in the background after edits, so this is mainly for the first-time build, an explicit rebuild, or dropping the index.",
+			"Build, rebuild, or drop the current project's persistent zvec-grep index. Use only when the user explicitly asks: searches already refresh a stale index before answering, so this is mainly for the first-time build, an explicit rebuild, or dropping the index.",
 		promptSnippet: "Explicitly build, rebuild, or drop the current project's zg index",
 		promptGuidelines: [
 			"Use zg_index only when the user explicitly requests indexing, rebuilding, or dropping the zg index; do not call it merely because zg_search reports a missing index -- that flow already offers to build it interactively.",
@@ -323,7 +380,7 @@ export default function (pi: ExtensionAPI) {
 				throw new Error("`zg` is not available on PATH. Install @zvec/zvec-grep separately before indexing.");
 			}
 
-			const args = ["index"];
+			const args = ["index", "--mode", "direct"];
 			if (params.drop) args.push("--drop", "--yes");
 			else if (params.rebuild) args.push("--rebuild");
 
@@ -341,8 +398,49 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "zg_status",
+		label: "zg status",
+		description:
+			"Report zg availability and the current project's index status (ready or not). Use to confirm zg is set up and the index is current before relying on semantic search, or to diagnose why zg_search/zg_rg return nothing. Reads pi's cached state (refreshed for this call) and does not spawn a separate `zg` subprocess. For full index detail/coverage, humans can use `/zg-status`.",
+		promptSnippet: "Check zg availability and index status",
+		parameters: Type.Object({}),
+		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+			if (!state.checked) await refreshZgState(pi, ctx, state, signal);
+			if (!state.available) {
+				throw new Error("`zg` is not available on PATH. Install @zvec/zvec-grep separately before checking status.");
+			}
+
+			await refreshZgState(pi, ctx, state, signal);
+			const index = state.indexed ? "index: ready" : "index: not ready";
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`zg: ${state.version || "available"}`,
+							index,
+						].join("\n"),
+					},
+				],
+				details: {
+					available: true,
+					version: state.version,
+					indexed: state.indexed,
+				},
+			};
+		},
+	});
+
+	pi.registerCommand("zg-settings", {
+		description: "Configure zg embedding model, device, and provider credentials",
+		handler: async (_args, ctx) => {
+			await openZgSettings(pi, ctx, state);
+		},
+	});
+
 	pi.registerCommand("zg-status", {
-		description: "Report zg version, server, and index status for this project",
+		description: "Report zg version and index status for this project",
 		handler: async (_args, ctx) => {
 			await refreshZgState(pi, ctx, state);
 			if (!state.available) {
@@ -353,7 +451,6 @@ export default function (pi: ExtensionAPI) {
 			const detail = await execZg(pi, ["status"], ctx);
 			const lines = [
 				`zg: ${state.version || "available"}`,
-				`server: ${state.serverRunning ? "running" : "stopped"}`,
 				"",
 				(detail.stdout || detail.stderr).trim(),
 			];
@@ -378,7 +475,7 @@ export default function (pi: ExtensionAPI) {
 				if (!confirmed) return;
 			}
 
-			const cmdArgs = ["index"];
+			const cmdArgs = ["index", "--mode", "direct"];
 			if (drop) cmdArgs.push("--drop", "--yes");
 			else if (rebuild) cmdArgs.push("--rebuild");
 
@@ -395,34 +492,4 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerCommand("zg-server", {
-		description: "Control the shared zg server: /zg-server <on|off|status>",
-		handler: async (args, ctx) => {
-			if (!state.available) {
-				ctx.ui.notify("zg: not found on PATH", "error");
-				return;
-			}
-
-			const action = args.trim().toLowerCase() || "status";
-			if (action !== "on" && action !== "off" && action !== "status") {
-				ctx.ui.notify("Usage: /zg-server <on|off|status>", "warning");
-				return;
-			}
-
-			if (action === "off") {
-				const confirmed = await ctx.ui.confirm(
-					"Stop the shared zg server?",
-					"This daemon may be used by other agents/tools (Claude, Cursor, etc.) configured via `zg install`. Stopping it affects all of them, not just this session.",
-				);
-				if (!confirmed) return;
-			}
-
-			const result = await execZg(pi, ["server", action], ctx, { timeout: 20_000 });
-			await refreshZgState(pi, ctx, state);
-			ctx.ui.notify(
-				(result.stdout || result.stderr).trim() || `zg server ${action} done.`,
-				result.code === 0 ? "info" : "error",
-			);
-		},
-	});
 }

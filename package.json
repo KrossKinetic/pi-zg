@@ -1,9 +1,16 @@
 {
 	"name": "@krosskinetic/pi-zg",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Pi extension for zvec-grep (zg): semantic code search, managed ripgrep, and shared-server-aware index management",
 	"type": "module",
-	"keywords": ["pi-package", "pi", "pi-coding-agent", "zvec-grep", "semantic-search", "code-search"],
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-coding-agent",
+		"zvec-grep",
+		"semantic-search",
+		"code-search"
+	],
 	"license": "MIT",
 	"author": "KrossKinetic",
 	"repository": {
@@ -13,9 +20,15 @@
 	"homepage": "https://github.com/KrossKinetic/pi-zg#readme",
 	"bugs": "https://github.com/KrossKinetic/pi-zg/issues",
 	"pi": {
-		"extensions": ["./extensions"]
+		"extensions": [
+			"./extensions"
+		]
 	},
-	"files": ["extensions", "README.md", "LICENSE"],
+	"files": [
+		"extensions",
+		"README.md",
+		"LICENSE"
+	],
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
 		"typebox": "*"
